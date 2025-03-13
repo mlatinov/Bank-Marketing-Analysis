@@ -26,7 +26,7 @@ only_numeric_pivot <- function(data){
   }
 
 ## Plot the numerical distributions
-only_numeric_pivot(bank_eda)%>%
+only_numeric_pivot(bank_eda_log)%>%
   ggplot(aes(x = Value,fill = after_stat(count)))+
   geom_histogram()+
   scale_fill_viridis_c(option = "magma")+
@@ -90,7 +90,37 @@ ggplot(aes(x = age, y = balance)) +
     axis.title = element_text(size = 12)
     )  
 
+## Bar Chart Function
+only_categorical_plot<- function(data,feature,title,y_name,fill_by_y,viridis_op){
+  
+  ## Normal Barchart 
+  if (!fill_by_y) {
+    data %>%
+      ggplot(aes(x = fct_infreq({{feature}}),fill = {{feature}}))+
+      scale_fill_viridis_d(option = viridis_op)+
+      geom_bar()+
+      coord_flip()+
+      theme_minimal()+
+      labs(
+        title = title,
+        x = y_name,
+        y = "Count")
+  }
+  # Fill Bar Chart by the Target Variable
+  else{
+    data %>%
+      ggplot(aes(x = fct_infreq({{feature}}),fill = y))+
+      scale_fill_viridis_d(option = viridis_op)+
+      geom_bar()+
+      coord_flip()+
+      theme_minimal()+
+      labs(
+        title = title,
+        x = y_name,
+        y = "Count")
+  }
+}
 
-
-
+# Plot Bar charts
+only_categorical_plot(data = bank_eda,feature = default,title = "Contact communication type and Success",y_name = "Comunication Type",fill_by_y = TRUE,viridis_op = "viridis")
 
