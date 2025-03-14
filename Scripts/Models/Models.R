@@ -2,13 +2,13 @@
 #### Libraries ####
 library(tidymodels)
 library(tidyverse)
+library(themis)
 tidymodels_prefer()
-
 
 #### Feature Engineering ####
 
 # Lood the data 
-bank_full <- read_delim("Data/data_raw/bank-full.csv",delim = ";", escape_double = FALSE, trim_ws = TRUE)
+bank_full <- read_delim("bank-full.csv",delim = ";", escape_double = FALSE, trim_ws = TRUE)
 
 # Remove duration 
 bank_full <- bank_full %>% select(-duration)
@@ -18,6 +18,8 @@ bank_full$y <- ifelse(test = bank_full$y == "no" ,yes = 0,no = 1 )
 
 # Change the outcome into factor
 bank_full$y <- as.factor(bank_full$y)
+
+
 
 ## Split the data 
 bank_split <- initial_split(data = bank_full,prop = 0.8,strata = y)
@@ -44,7 +46,9 @@ recipe_basic <- recipe(y ~ .,data = train_data)%>%
   step_scale(all_numeric_predictors()) %>%
   
   # Dummy encode all nominal predictors
-  step_dummy(all_nominal_predictors())
+  step_dummy(all_nominal_predictors()) 
+  
+
 
 #### Define models ####
 
@@ -58,13 +62,13 @@ d_tree <- decision_tree(tree_depth = tune(),min_n = tune())%>%
   set_engine("rpart")%>%
   set_mode("classification")
 
-## SVM Radial 
-svm_spec <- svm_rbf(cost = tune(),rbf_sigma = tune())%>%
-  set_engine("kernlab") %>%
+## SVM Poly
+svm_spec <- svm_poly(cost = tune(),degree = tune())%>%
+  set_engine("kernlab")%>%
   set_mode("classification")
 
 ## Random Forest 
-rf_spec <- rand_forest(mtry = tune(),trees = 200,min_n = tune())%>%
+rf_spec <- rand_forest(mtry = tune(),trees = 300,min_n = tune())%>%
   set_engine("ranger")%>%
   set_mode("classification")
 
@@ -94,7 +98,7 @@ d_tree_workflow <-
   add_recipe(recipe = recipe_basic)%>%
   add_model(spec = d_tree)
 
-# SVM Radial
+# SVM Poly
 svm_workflow <- 
   workflow() %>%
   add_recipe(recipe = recipe_basic)%>%
@@ -119,17 +123,17 @@ d_tree_params <-
   d_tree_workflow %>%
   extract_parameter_set_dials()%>%
   update(
-    tree_depth = tree_depth(c(5,15)),
-    min_n = min_n(c(20,100))
+    tree_depth = tree_depth(c(5,20)),
+    min_n = min_n(c(10,150))
   )
 
-# SVM Radial 
+# SVM Poly
 svm_params <- 
   svm_workflow %>%
   extract_parameter_set_dials()%>%
   update(
-    cost = cost(c(-10,5)),
-    rbf_sigma = rbf_sigma(c(-10,0))
+    cost = cost(c(-5,5)),
+    degree = degree(c(1,3))
   )
 
 # RF
@@ -139,7 +143,7 @@ rf_params <-
   finalize(x = train_data)%>%
   update(
     mtry = mtry(c(1,16)),
-    min_n = min_n(c(20,100))
+    min_n = min_n(c(10,100))
   )
 
 # XGBoost
@@ -162,7 +166,7 @@ xgb_params <-
 d_tree_grid <- d_tree_params %>%
   grid_space_filling()
 
-# SVM Radianl LHC Grid
+# SVM Poly LHC Grid
 svm_grid <- svm_params %>%
   grid_space_filling()
 
@@ -174,10 +178,13 @@ rf_grid <- rf_params %>%
 xgb_grid <- xgb_params %>%
   grid_space_filling()
 
-#### Rasample and Evaluationg Metric ####
+#### Rasample and Evaluation Metric ####
 
-## Create a Cross Validation Resampling Method
-resample_cv <- vfold_cv(data = train_data,v = 10)
+## Create a Cross-Validation with stratification 
+resample_cv <- vfold_cv(data = train_data,v = 10,strata = y)
+
+## Create a Monte Carlo cross-validation with stratification
+resample_mccv <- mc_cv(data = train_data,prop = 0.8,times = 15,strata = y)
 
 ## Metric 
 metric <- metric_set(roc_auc)
@@ -191,6 +198,8 @@ log_regression_fit <-
     resamples = resample_cv,
     metrics = metric)
 
+log_regression_fit$.metrics
+  
 # Decision trees
 d_tree_initial <-
   d_tree_workflow %>%
@@ -199,12 +208,33 @@ d_tree_initial <-
     metrics = metric,
     grid = d_tree_grid)
 
-d_t
+# SVM Poly 
+svm_initial <- 
+  svm_workflow %>%
+  tune_grid(
+    resamples = resample_mccv,
+    grid = svm_grid,
+    metrics = metric)
 
+# RF
+rf_initial <- 
+  rf_workflow %>%
+  tune_grid(
+    resamples = resample_mccv,
+    grid = rf_grid,
+    metrics = metric
+  )
+rf_initial$.metrics
 
+# XGB 
+xbg_initial <- 
+  xgb_worklow %>%
+  tune_grid(
+    resamples = resample_mccv,
+    grid = xgb_grid,
+    metrics = metric
+  )
 
+xbg_initial$.metrics
 
-
-
-
-
+#### Bayesian optimization ####
