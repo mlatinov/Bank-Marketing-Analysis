@@ -3,7 +3,16 @@
 library(tidymodels)
 library(tidyverse)
 library(themis)
+library(doParallel)
+library(finetune)
+library(future)
+
 tidymodels_prefer()
+
+num_cores <- parallel::detectCores()  # Detect the number of cores on your machine
+
+# Set up parallel processing using `future`
+plan(multisession, workers = min(num_cores, 4))
 
 #### Feature Engineering ####
 
@@ -18,7 +27,6 @@ bank_full$y <- ifelse(test = bank_full$y == "no" ,yes = 0,no = 1 )
 
 # Change the outcome into factor
 bank_full$y <- as.factor(bank_full$y)
-
 
 
 ## Split the data 
@@ -187,7 +195,10 @@ resample_cv <- vfold_cv(data = train_data,v = 10,strata = y)
 resample_mccv <- mc_cv(data = train_data,prop = 0.8,times = 15,strata = y)
 
 ## Metric 
-metric <- metric_set(roc_auc)
+metric <- metric_set(pr_auc)
+
+# Control resample 
+control_resample <- control_resamples(verbose = TRUE,parallel_over = "everything")
 
 #### Initial Search ####
 
@@ -196,8 +207,8 @@ log_regression_fit <-
   log_regression_workflow %>%
   fit_resamples(
     resamples = resample_cv,
-    metrics = metric)
-
+    metrics = metric
+    )
 log_regression_fit$.metrics
   
 # Decision trees
@@ -222,7 +233,8 @@ rf_initial <-
   tune_grid(
     resamples = resample_mccv,
     grid = rf_grid,
-    metrics = metric
+    metrics = metric,
+    control = control_resample
   )
 rf_initial$.metrics
 
@@ -234,7 +246,75 @@ xbg_initial <-
     grid = xgb_grid,
     metrics = metric
   )
-
 xbg_initial$.metrics
 
 #### Bayesian optimization ####
+
+# Define a BO control
+control_bo <- control_bayes(verbose = TRUE,parallel_over = "everything")
+
+# Metric to optimize
+metric_bo <- metric_set(pr_auc)
+
+# Execute BO on RF
+rf_bo <- 
+  rf_workflow %>%
+  tune_bayes(
+    resamples = resample_mccv,
+    initial = rf_initial,
+    param_info = rf_params,
+    iter = 20,
+    metrics = metric_bo,
+    control = control_bo
+    )
+
+# Best result 
+best_rf_bo <- select_best(rf_bo,metric = "pr_auc")
+
+#### Simulated Annealing ####
+
+# Define SA control 
+control_sa <- control_sim_anneal(
+  parallel_over = "everything",
+  verbose = TRUE,
+  no_improve = 10
+  )
+
+# Metric to optimize
+metric_sa <- metric_set(pr_auc)
+
+# Execute SA on RF
+rf_sa <- 
+  rf_workflow %>%
+  tune_sim_anneal(
+    resamples = resample_mccv,
+    param_info = rf_params,
+    iter = 20,
+    metrics = metric_sa,
+    initial = rf_initial,
+    control = control_sa
+    )
+
+# Best results
+best_sa_rf <- select_best(rf_sa,metric = "roc_auc")
+
+#### Model Fitting ####
+
+stopCluster(cl)
+registerDoSEQ()  # Switch back to sequential mode
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
