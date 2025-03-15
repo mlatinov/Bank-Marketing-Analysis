@@ -6,6 +6,7 @@ library(themis)
 library(doParallel)
 library(finetune)
 library(future)
+library(ROCR)
 
 tidymodels_prefer()
 
@@ -54,10 +55,11 @@ recipe_basic <- recipe(y ~ .,data = train_data)%>%
   step_scale(all_numeric_predictors()) %>%
   
   # Dummy encode all nominal predictors
-  step_dummy(all_nominal_predictors()) 
+  step_dummy(all_nominal_predictors()) %>%
   
-
-
+  # Use SMOTE to balance the data
+  step_smote(y,over_ratio = 0.5)
+  
 #### Define models ####
 
 ## Log Regression Baseline
@@ -151,7 +153,7 @@ rf_params <-
   finalize(x = train_data)%>%
   update(
     mtry = mtry(c(1,16)),
-    min_n = min_n(c(10,100))
+    min_n = min_n(c(5,100))
   )
 
 # XGBoost
@@ -195,7 +197,7 @@ resample_cv <- vfold_cv(data = train_data,v = 10,strata = y)
 resample_mccv <- mc_cv(data = train_data,prop = 0.8,times = 15,strata = y)
 
 ## Metric 
-metric <- metric_set(pr_auc)
+metric <- metric_set(pr_auc,roc_auc,accuracy)
 
 # Control resample 
 control_resample <- control_resamples(verbose = TRUE,parallel_over = "everything")
@@ -254,7 +256,7 @@ xbg_initial$.metrics
 control_bo <- control_bayes(verbose = TRUE,parallel_over = "everything")
 
 # Metric to optimize
-metric_bo <- metric_set(pr_auc)
+metric_bo <- metric_set(pr_auc,roc_auc)
 
 # Execute BO on RF
 rf_bo <- 
@@ -296,9 +298,35 @@ rf_sa <-
     )
 
 # Best results
-best_sa_rf <- select_best(rf_sa,metric = "roc_auc")
+best_sa_rf <- select_best(rf_sa,metric = "pr_auc")
 
-#### Model Fitting ####
+#### Model Fitting & Evaluation ####
+
+# Finalize the workflow with the best params 
+final_bo_rf <- finalize_workflow(rf_workflow,best_rf_bo)
+
+# Fit the RF model 
+rf_fit <- fit(final_bo_rf,train_data)
+
+# Predictions
+rf_prediction <- predict(rf_fit,testing_data,type = "prob")
+
+# Take the positive class
+rf_prediction_pos <- rf_prediction$.pred_1
+
+# Compute the ROC curve
+rf_roc <- roc_curve(rf_data,truth,.pred)
+autoplot(rf_roc)
+rf_pr_roc <- pr_auc(rf_data,truth,.pred)
+rf_auc <- roc_auc(rf_data,truth,.pred)
+
+# Create predicted class labels
+rf_data$predicted_class <- ifelse(rf_data$.pred > 0.5, "0", "1")
+rf_data$predicted_class <- as.factor(rf_data$predicted_class)
+
+# Confusion Matrix
+table(Predicted = rf_data$predicted_class, Actual = rf_data$truth)
+
 
 stopCluster(cl)
 registerDoSEQ()  # Switch back to sequential mode
