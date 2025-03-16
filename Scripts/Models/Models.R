@@ -81,7 +81,7 @@ svm_spec <- svm_poly(cost = tune(),degree = tune())%>%
 
 ## Random Forest 
 rf_spec <- rand_forest(mtry = tune(),trees = 300,min_n = tune())%>%
-  set_engine("ranger",case.weights = train_data$weights)%>%
+  set_engine("ranger")%>%
   set_mode("classification")
 
 ## XGB
@@ -102,27 +102,24 @@ xgb_spec <- boost_tree(
 log_regression_workflow <-
   workflow() %>%
   add_recipe(recipe = recipe_basic)%>%
-  add_case_weights(weight)%>%
   add_model(spec = log_regression)
 
 # Decision trees
 d_tree_workflow <- 
   workflow() %>%
   add_recipe(recipe = recipe_basic)%>%
-  add_case_weights(weights)%>%
   add_model(spec = d_tree)
 
 # SVM Poly
 svm_workflow <- 
   workflow() %>%
   add_recipe(recipe = recipe_basic)%>%
-  add_case_weights(weights)%>%
   add_model(spec = svm_spec)
 
 # Random Forest 
 rf_workflow <- 
   workflow() %>%
-  add_case_weights(weights)%>%
+  add_case_weights(weights) %>%
   add_recipe(recipe = recipe_basic) %>%
   add_model(spec = rf_spec)
 
@@ -130,7 +127,6 @@ rf_workflow <-
 xgb_worklow <- 
   workflow() %>%
   add_recipe(recipe = recipe_basic)%>%
-  add_case_weights(col = train_data$weights)%>%
   add_model(spec = xgb_spec)
 
 #### Set parameter ####
@@ -316,7 +312,7 @@ md_fit_eval <- function(workflow, best_params, train_data, testing_data) {
     mutate(weights = as.numeric(weights))
   
   # Finalize the workflow with the best params
-  final_md <- finalize_workflow(rf_workflow, best_rf_bo)
+  final_md <- finalize_workflow(workflow, best_params)
   
   # Fit the model with weights
   final_model <- workflows::fit(object = final_md, data = train_data)
