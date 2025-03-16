@@ -6,7 +6,8 @@ library(themis)
 library(doParallel)
 library(finetune)
 library(future)
-library(ROCR)
+library(pROC)
+library(PRROC)
 
 tidymodels_prefer()
 
@@ -41,24 +42,25 @@ testing_data <- testing(bank_split)
 
 ## Recipe ##
 
+## Add Case Weights with frequency_weights
+train_data <- train_data %>%
+  mutate(weights = hardhat::frequency_weights(as.numeric(y)))
+
 # Make a basic recipe
 recipe_basic <- recipe(y ~ .,data = train_data)%>%
   
   # Remove near zero variance features
   step_nzv(all_nominal_predictors()) %>%
   
-  # Transform all numerical featues to reduce numerical skewness
-  step_YeoJohnson(all_numeric_predictors()) %>%
+  # Transform all numerical features to reduce numerical skewness
+  step_YeoJohnson(all_numeric_predictors(),-weights) %>%
   
   # Center and Scale all numerical features
-  step_center(all_numeric_predictors()) %>%
-  step_scale(all_numeric_predictors()) %>%
+  step_center(all_numeric_predictors(),-weights) %>%
+  step_scale(all_numeric_predictors(),-weights) %>%
   
   # Dummy encode all nominal predictors
-  step_dummy(all_nominal_predictors()) %>%
-  
-  # Use SMOTE to balance the data
-  step_smote(y,over_ratio = 0.5)
+  step_dummy(all_nominal_predictors()) 
   
 #### Define models ####
 
@@ -79,7 +81,7 @@ svm_spec <- svm_poly(cost = tune(),degree = tune())%>%
 
 ## Random Forest 
 rf_spec <- rand_forest(mtry = tune(),trees = 300,min_n = tune())%>%
-  set_engine("ranger")%>%
+  set_engine("ranger",case.weights = train_data$weights)%>%
   set_mode("classification")
 
 ## XGB
@@ -100,23 +102,27 @@ xgb_spec <- boost_tree(
 log_regression_workflow <-
   workflow() %>%
   add_recipe(recipe = recipe_basic)%>%
+  add_case_weights(weight)%>%
   add_model(spec = log_regression)
 
 # Decision trees
 d_tree_workflow <- 
   workflow() %>%
   add_recipe(recipe = recipe_basic)%>%
+  add_case_weights(weights)%>%
   add_model(spec = d_tree)
 
 # SVM Poly
 svm_workflow <- 
   workflow() %>%
   add_recipe(recipe = recipe_basic)%>%
+  add_case_weights(weights)%>%
   add_model(spec = svm_spec)
 
 # Random Forest 
 rf_workflow <- 
   workflow() %>%
+  add_case_weights(weights)%>%
   add_recipe(recipe = recipe_basic) %>%
   add_model(spec = rf_spec)
 
@@ -124,6 +130,7 @@ rf_workflow <-
 xgb_worklow <- 
   workflow() %>%
   add_recipe(recipe = recipe_basic)%>%
+  add_case_weights(col = train_data$weights)%>%
   add_model(spec = xgb_spec)
 
 #### Set parameter ####
@@ -194,7 +201,7 @@ xgb_grid <- xgb_params %>%
 resample_cv <- vfold_cv(data = train_data,v = 10,strata = y)
 
 ## Create a Monte Carlo cross-validation with stratification
-resample_mccv <- mc_cv(data = train_data,prop = 0.8,times = 15,strata = y)
+resample_mccv <- mc_cv(data = train_data,prop = 0.8,times = 10,strata = y)
 
 ## Metric 
 metric <- metric_set(pr_auc,roc_auc,accuracy)
@@ -219,7 +226,8 @@ d_tree_initial <-
   tune_grid(
     resamples = resample_cv,
     metrics = metric,
-    grid = d_tree_grid)
+    grid = d_tree_grid
+    )
 
 # SVM Poly 
 svm_initial <- 
@@ -236,8 +244,7 @@ rf_initial <-
     resamples = resample_mccv,
     grid = rf_grid,
     metrics = metric,
-    control = control_resample
-  )
+    control = control_resample)
 rf_initial$.metrics
 
 # XGB 
@@ -246,7 +253,8 @@ xbg_initial <-
   tune_grid(
     resamples = resample_mccv,
     grid = xgb_grid,
-    metrics = metric
+    metrics = metric,
+    control = control_resample
   )
 xbg_initial$.metrics
 
@@ -265,13 +273,13 @@ rf_bo <-
     resamples = resample_mccv,
     initial = rf_initial,
     param_info = rf_params,
-    iter = 20,
+    iter = 10,
     metrics = metric_bo,
     control = control_bo
     )
 
 # Best result 
-best_rf_bo <- select_best(rf_bo,metric = "pr_auc")
+best_rf_bo <- select_best(rf_bo,metric = "roc_auc")
 
 #### Simulated Annealing ####
 
@@ -291,7 +299,7 @@ rf_sa <-
   tune_sim_anneal(
     resamples = resample_mccv,
     param_info = rf_params,
-    iter = 20,
+    iter = 10,
     metrics = metric_sa,
     initial = rf_initial,
     control = control_sa
@@ -300,37 +308,73 @@ rf_sa <-
 # Best results
 best_sa_rf <- select_best(rf_sa,metric = "pr_auc")
 
-#### Model Fitting & Evaluation ####
+# Function to compute metrics and plot AUC curve and Confusion Matrix
+md_fit_eval <- function(workflow, best_params, train_data, testing_data) {
+  
+  # Convert weights to numeric
+  train_data <- train_data %>%
+    mutate(weights = as.numeric(weights))
+  
+  # Finalize the workflow with the best params
+  final_md <- finalize_workflow(rf_workflow, best_rf_bo)
+  
+  # Fit the model with weights
+  final_model <- workflows::fit(object = final_md, data = train_data)
+  
+  # Predictions on the test data
+  predictions <- predict(final_model, testing_data, type = "prob") %>%
+    bind_cols(predict(final_model, testing_data, type = "class")) %>%
+    bind_cols(testing_data) 
+  
+  # Extract positive class probabilities and true labels
+  prediction_pos <- predictions$.pred_1
+  true_labels <- predictions$y
+  
+  # Compute AUC
+  roc_result <- roc(true_labels, prediction_pos)
+  auc_value <- auc(roc_result)
+  
+  # Compute PR AUC
+  pr_auc_value <- pr_auc(predictions, truth = y, .pred_1)$.estimate
+  
+  # Convert probabilities to class predictions (threshold = 0.5)
+  predictions <- predictions %>%
+    mutate(predicted_class = factor(ifelse(.pred_1 >= 0.5, "1", "0"), levels = levels(true_labels)))
+  
+  # Accuracy
+  accuracy_value <- accuracy(predictions, truth = y, estimate = predicted_class)$.estimate
+  
+  # Confusion Matrix
+  conf_matrix <- conf_mat(predictions, truth = y, estimate = predicted_class)
+  
+  # Plot AUC curve
+  auc_plot <- ggroc(roc_result) + ggtitle("ROC Curve")
+  
+  # Plot confusion matrix
+  conf_matrix_plot <- conf_matrix %>%
+    autoplot(type = "heatmap") + ggtitle("Confusion Matrix")
+  
+  # Return results
+  return(list(
+    auc = auc_value,
+    pr_auc = pr_auc_value,
+    accuracy = accuracy_value,
+    auc_plot = auc_plot,
+    conf_matrix_plot = conf_matrix_plot
+  ))
+}
 
-# Finalize the workflow with the best params 
-final_bo_rf <- finalize_workflow(rf_workflow,best_rf_bo)
-
-# Fit the RF model 
-rf_fit <- fit(final_bo_rf,train_data)
-
-# Predictions
-rf_prediction <- predict(rf_fit,testing_data,type = "prob")
-
-# Take the positive class
-rf_prediction_pos <- rf_prediction$.pred_1
-
-# Compute the ROC curve
-rf_roc <- roc_curve(rf_data,truth,.pred)
-autoplot(rf_roc)
-rf_pr_roc <- pr_auc(rf_data,truth,.pred)
-rf_auc <- roc_auc(rf_data,truth,.pred)
-
-# Create predicted class labels
-rf_data$predicted_class <- ifelse(rf_data$.pred > 0.5, "0", "1")
-rf_data$predicted_class <- as.factor(rf_data$predicted_class)
-
-# Confusion Matrix
-table(Predicted = rf_data$predicted_class, Actual = rf_data$truth)
+# Evaluate RF Model 
+md_fit_eval(
+  workflow = rf_workflow,
+  best_params = best_rf_bo,
+  train_data = train_data,
+  testing_data = testing_data
+  )
 
 
 stopCluster(cl)
 registerDoSEQ()  # Switch back to sequential mode
-
 
 
 
