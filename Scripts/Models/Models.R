@@ -8,6 +8,7 @@ library(finetune)
 library(future)
 library(pROC)
 library(PRROC)
+library(isotree)
 
 tidymodels_prefer()
 
@@ -40,11 +41,63 @@ train_data <- training(bank_split)
 # Testing data 
 testing_data <- testing(bank_split)
 
-## Recipe ##
+## Tune and train IsoForest to add new feature 
 
-## Add Case Weights with frequency_weights
+# Params
+params <- list(
+  ntrees = 300,
+  sample_size = 256,
+  ndim = 2,
+  prob_pick_pooled_gain = 0.5
+)
+
+# Define parameter grid
+param_grid <- expand.grid(
+  ntrees = c(100, 300, 500),
+  sample_size = c(128, 256, 512),
+  ndim = c(1, 2),
+  prob_pick_pooled_gain = c(0, 0.5, 1)
+)
+
+# Function to fit and score iForest
+tune_iforest <- function(params) {
+  model <- isolation.forest(
+    data = train_data %>% select(-y),
+    ntrees = params$ntrees,
+    sample_size = params$sample_size,
+    ndim = params$ndim,
+    prob_pick_pooled_gain = params$prob_pick_pooled_gain
+  )
+  mean(predict(model, newdata = train_data %>% select(-y), type = "score"))
+}
+
+# Extract the params
+results <- param_grid %>%
+  split(1:nrow(.)) %>%  
+  map_dbl(~ tune_iforest(.))  
+
+best_params <- param_grid[which.max(results), ]
+
+## Train the model 
+iso_tree <- isolation.forest(
+  data = train_data%>%select(-y),
+  sample_size =best_params$sample_size,
+  ntrees = best_params$ntrees,
+  ndim = best_params$ndim,
+  prob_pick_pooled_gain = best_params$prob_pick_pooled_gain
+  )
+
+# Score Predictions and save it as new Feature anomaly_score
 train_data <- train_data %>%
-  mutate(weights = hardhat::frequency_weights(as.numeric(y)))
+  mutate(anomaly_score = predict(iso_tree, newdata = train_data %>% select(-y), type = "score"))%>%
+  mutate(anomaly_score = if_else(anomaly_score > 0.5,0,1))
+
+testing_data <- testing_data %>%
+  mutate(anomaly_score = 1) %>%
+  mutate(anomaly_score = predict(iso_tree, newdata = testing_data %>% select(-y), type = "score"))%>%
+  mutate(anomaly_score = if_else(anomaly_score > 0.5,0,1))
+
+## Recipe ##
 
 # Make a basic recipe
 recipe_basic <- recipe(y ~ .,data = train_data)%>%
@@ -52,21 +105,28 @@ recipe_basic <- recipe(y ~ .,data = train_data)%>%
   # Remove near zero variance features
   step_nzv(all_nominal_predictors()) %>%
   
+  # Collapse rare categorical levels into "Other"
+  step_other(all_nominal_predictors(), threshold = 0.05) %>%
+  
   # Transform all numerical features to reduce numerical skewness
-  step_YeoJohnson(all_numeric_predictors(),-weights) %>%
+  step_YeoJohnson(all_numeric_predictors(),-anomaly_score) %>%
   
   # Center and Scale all numerical features
-  step_center(all_numeric_predictors(),-weights) %>%
-  step_scale(all_numeric_predictors(),-weights) %>%
+  step_center(all_numeric_predictors(),-anomaly_score) %>%
+  step_scale(all_numeric_predictors(),-anomaly_score) %>%
   
   # Dummy encode all nominal predictors
-  step_dummy(all_nominal_predictors()) 
+  step_dummy(all_nominal_predictors()) %>%
+  
+  # Sampling to balance the data
+  step_downsample(y,under_ratio = 3) %>%
+  step_upsample(y ,over_ratio = 2)
   
 #### Define models ####
 
 ## Log Regression Baseline
-log_regression <- logistic_reg()%>%
-  set_engine("glm")%>%
+log_regression <- logistic_reg(penalty = tune(),mixture = tune())%>%
+  set_engine("glmnet")%>%
   set_mode("classification")
 
 ## Decision trees
@@ -119,7 +179,6 @@ svm_workflow <-
 # Random Forest 
 rf_workflow <- 
   workflow() %>%
-  add_case_weights(weights) %>%
   add_recipe(recipe = recipe_basic) %>%
   add_model(spec = rf_spec)
 
@@ -130,6 +189,14 @@ xgb_worklow <-
   add_model(spec = xgb_spec)
 
 #### Set parameter ####
+
+log_regression_params <-
+  log_regression_workflow %>%
+  extract_parameter_set_dials() %>%
+  update(
+    penalty = penalty(c(-10,1)),
+    mixture = mixture(c(0,1))
+  )
 
 # Decision trees
 d_tree_params <- 
@@ -175,6 +242,10 @@ xgb_params <-
   
 #### Start Grid  ####
 
+# Log reg LHC Grid
+log_regression_grid <- log_regression_params %>%
+  grid_space_filling()
+
 # Decision trees LHC Grid
 d_tree_grid <- d_tree_params %>%
   grid_space_filling()
@@ -207,14 +278,16 @@ control_resample <- control_resamples(verbose = TRUE,parallel_over = "everything
 
 #### Initial Search ####
 
-#<> Fit the log regression
+## Fit the log regression
 log_regression_fit <- 
   log_regression_workflow %>%
-  fit_resamples(
+  tune_grid(
     resamples = resample_cv,
-    metrics = metric
-    )
-log_regression_fit$.metrics
+    metrics = metric,
+    grid = log_regression_grid)
+
+# Select best
+best_log_r_initial <- select_best(log_regression_fit,metric = "roc_auc")
   
 # Decision trees
 d_tree_initial <-
@@ -222,8 +295,8 @@ d_tree_initial <-
   tune_grid(
     resamples = resample_cv,
     metrics = metric,
-    grid = d_tree_grid
-    )
+    grid = d_tree_grid,
+    control = control_resample)
 
 # SVM Poly 
 svm_initial <- 
@@ -231,7 +304,8 @@ svm_initial <-
   tune_grid(
     resamples = resample_mccv,
     grid = svm_grid,
-    metrics = metric)
+    metrics = metric,
+    control = control_resample)
 
 # RF
 rf_initial <- 
@@ -241,7 +315,9 @@ rf_initial <-
     grid = rf_grid,
     metrics = metric,
     control = control_resample)
-rf_initial$.metrics
+
+#Select best params
+best_rf_initial <- select_best(rf_initial,metric = "roc_auc")
 
 # XGB 
 xbg_initial <- 
@@ -250,9 +326,11 @@ xbg_initial <-
     resamples = resample_mccv,
     grid = xgb_grid,
     metrics = metric,
-    control = control_resample
-  )
+    control = control_resample)
 xbg_initial$.metrics
+
+#Select best params
+best_xbg_initial <- select_best(xbg_initial,metric = "roc_auc")
 
 #### Bayesian optimization ####
 
@@ -307,10 +385,6 @@ best_sa_rf <- select_best(rf_sa,metric = "pr_auc")
 # Function to compute metrics and plot AUC curve and Confusion Matrix
 md_fit_eval <- function(workflow, best_params, train_data, testing_data) {
   
-  # Convert weights to numeric
-  train_data <- train_data %>%
-    mutate(weights = as.numeric(weights))
-  
   # Finalize the workflow with the best params
   final_md <- finalize_workflow(workflow, best_params)
   
@@ -360,14 +434,31 @@ md_fit_eval <- function(workflow, best_params, train_data, testing_data) {
   ))
 }
 
-# Evaluate RF Model 
+# Evaluate Models
+
+# Log r initial
 md_fit_eval(
-  workflow = rf_workflow,
-  best_params = best_rf_bo,
+  workflow = log_regression_workflow,
+  best_params = best_log_r_initial,
+  train_data = train_data,
+  testing_data = testing_data
+)
+
+# XGB initial
+md_fit_eval(
+  workflow = xgb_worklow,
+  best_params = best_xbg_initial,
   train_data = train_data,
   testing_data = testing_data
   )
 
+# RF
+md_fit_eval(
+  workflow = rf_workflow,
+  best_params = best_rf_initial,
+  train_data = train_data,
+  testing_data = testing_data
+  )
 
 stopCluster(cl)
 registerDoSEQ()  # Switch back to sequential mode
